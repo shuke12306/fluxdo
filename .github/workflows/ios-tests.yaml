@@ -1,0 +1,78 @@
+name: iOS Tests
+
+# iOS 模拟器测试 job(测试基建):
+# 在 macOS runner 上以 Debug 配置跑 ios/RunnerTests 的 XCTest。
+# 复用 build.yaml 的 Flutter/Rust/缓存模式;先在 fork 分支上迭代调通,
+# 进上游前再讨论是否挂 pull_request 触发与路径过滤。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/ios-simulator-tests
+
+jobs:
+  simulator-tests:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.0'
+          cache: true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core/doh_proxy
+          key: ios-tests
+
+      - name: Setup iOS Rust targets
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Configure Git for CocoaPods
+        run: git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
+
+      # flutterw 会自动完成 pub get / l10n / 证书资源 / Rust 原生库准备,
+      # --config-only 只生成 Generated.xcconfig 与插件注册文件,不做完整构建
+      - name: Generate Flutter iOS config
+        run: dart tool/flutterw.dart build ios --config-only --simulator --debug
+
+      # 幂等兜底:确认两份静态库确实已落盘(xcodebuild 链接阶段硬依赖)
+      - name: Verify native libs staged
+        run: |
+          dart run tool/project_tasks.dart native:prepare ios
+          test -f ios/rust_libs/simulator/libdoh_proxy.a
+          test -f ios/rust_libs/device/libdoh_proxy.a
+
+      - name: Pod install
+        run: pod install --project-directory=ios
+
+      - name: Run RunnerTests on iOS Simulator
+        run: |
+          set -o pipefail
+          DEVICE=$(xcrun simctl list devices available | grep -E "iPhone [0-9]" | head -n 1 | awk -F' \\(' '{print $1}' | xargs)
+          echo "使用模拟器: ${DEVICE}"
+          xcodebuild test \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -destination "platform=iOS Simulator,name=${DEVICE}" \
+            -resultBundlePath build/ios-test-results.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-test-results
+          path: build/ios-test-results.xcresult
+          if-no-files-found: ignore

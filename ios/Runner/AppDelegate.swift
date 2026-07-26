@@ -191,7 +191,7 @@ import workmanager_apple
             // 确保 WKWebView 在创建时即可从 shared storage 读取到 cookie。
             storage.setCookie(cookie)
           } else {
-            AppDelegate.deleteSharedCookieIOS(storage: storage, url: url, cookie: cookie)
+            CookiePrimitives.deleteSharedCookie(storage: storage, url: url, cookie: cookie)
           }
           let store = WKWebsiteDataStore.default().httpCookieStore
           store.setCookie(cookie) {
@@ -203,25 +203,25 @@ import workmanager_apple
         // 设计依据: docs/cookie-sync-design-v0.4.0.md §5.4
 
         case "nukeAllVariants":
+          // domainCandidates/pathCandidates 仅保留通道契约校验;
+          // 原语按真实 cookie 对象枚举, 不再使用候选猜测 (见 CookiePrimitives)
           guard let args = call.arguments as? [String: Any],
                 let urlString = args["url"] as? String,
                 let name = args["name"] as? String,
-                let pathCandidates = args["pathCandidates"] as? [String],
+                args["pathCandidates"] is [String],
                 let url = URL(string: urlString) else {
             result(0)
             return
           }
-          let rawDomainCandidates = args["domainCandidates"] as? [Any] ?? []
-          let domainCandidates: [String?] = rawDomainCandidates.map {
-            $0 is NSNull ? nil : ($0 as? String)
-          }
-          AppDelegate.nukeAllVariantsIOS(
+          CookiePrimitives.nukeAllVariants(
+            store: WKWebsiteDataStore.default().httpCookieStore,
+            storage: HTTPCookieStorage.shared,
             url: url,
             name: name,
-            domainCandidates: domainCandidates,
-            pathCandidates: pathCandidates,
-            result: result
-          )
+            writeGuard: CookieStoreObserverHandler.shared
+          ) { deleted in
+            result(deleted)
+          }
 
         case "deleteExactCookie":
           guard let args = call.arguments as? [String: Any],
@@ -233,13 +233,17 @@ import workmanager_apple
             return
           }
           let domain = args["domain"] as? String
-          AppDelegate.deleteExactCookieIOS(
+          CookiePrimitives.deleteExactCookie(
+            store: WKWebsiteDataStore.default().httpCookieStore,
+            storage: HTTPCookieStorage.shared,
             url: url,
             name: name,
             domain: domain,
             path: path,
-            result: result
-          )
+            writeGuard: CookieStoreObserverHandler.shared
+          ) { deleted in
+            result(deleted)
+          }
 
         case "getAllCookieInfos":
           guard let args = call.arguments as? [String: Any],
@@ -248,7 +252,12 @@ import workmanager_apple
             result([])
             return
           }
-          AppDelegate.getAllCookieInfosIOS(url: url, result: result)
+          CookiePrimitives.getAllCookieInfos(
+            store: WKWebsiteDataStore.default().httpCookieStore,
+            url: url
+          ) { infos in
+            result(infos)
+          }
 
         case "countCookiesByName":
           guard let args = call.arguments as? [String: Any],
@@ -258,7 +267,13 @@ import workmanager_apple
             result(0)
             return
           }
-          AppDelegate.countCookiesByNameIOS(url: url, name: name, result: result)
+          CookiePrimitives.countCookiesByName(
+            store: WKWebsiteDataStore.default().httpCookieStore,
+            url: url,
+            name: name
+          ) { count in
+            result(count)
+          }
 
         default:
           result(FlutterMethodNotImplemented)
@@ -409,227 +424,8 @@ import workmanager_apple
     }
   }
 
-  // MARK: - Cookie 引擎 v0.4.0 原语
-  //
-  // 设计依据: docs/cookie-sync-design-v0.4.0.md §5.4
-  //
-  // 关键平台特性 (依据 §3.1 / §3.2 / §3.6):
-  // - WKHTTPCookieStore 与 HTTPCookieStorage.shared 同步不可靠 → 双写双删
-  // - WKHTTPCookieStore.delete completion 在 main queue 回调
-  // - HTTPCookie.domain 对 host-only cookie 仍返回 host (无前导点)
-
-  /// 把 HTTPCookie.sameSitePolicy 转成 Dart 端可识别的字符串 ("Lax"/"Strict"/"None")。
-  /// iOS 13+/macOS 10.15+ 支持; 早期系统返回 nil。
-  private static func sameSiteString(_ cookie: HTTPCookie) -> String? {
-    if #available(iOS 13.0, *) {
-      guard let policy = cookie.sameSitePolicy else { return nil }
-      switch policy {
-      case .sameSiteLax:
-        return "Lax"
-      case .sameSiteStrict:
-        return "Strict"
-      default:
-        let raw = policy.rawValue.lowercased()
-        if raw.contains("none") { return "None" }
-        if raw.contains("lax") { return "Lax" }
-        if raw.contains("strict") { return "Strict" }
-        return nil
-      }
-    }
-    return nil
-  }
-
-  /// domain 匹配规则 (用于 Sentinel 枚举/删除变体)
-  ///
-  /// - candidate 为 nil 表示 host-only 候选, 要求 cookie.domain == host
-  /// - candidate 非 nil 时, 容忍前导点差异 (".example.com" 等价 "example.com")
-  private static func matchDomain(cookieDomain: String, candidate: String?, host: String) -> Bool {
-    let normalizedCookieDomain = (cookieDomain.hasPrefix(".")
-      ? String(cookieDomain.dropFirst())
-      : cookieDomain).lowercased()
-    if let candidate = candidate {
-      let normalizedCandidate = (candidate.hasPrefix(".")
-        ? String(candidate.dropFirst())
-        : candidate).lowercased()
-      return normalizedCookieDomain == normalizedCandidate
-    } else {
-      return normalizedCookieDomain == host
-    }
-  }
-
-  private static func deleteSharedCookieIOS(
-    storage: HTTPCookieStorage,
-    url: URL,
-    cookie: HTTPCookie
-  ) {
-    let host = (url.host ?? "").lowercased()
-    guard let sharedCookies = storage.cookies else { return }
-    for sharedCookie in sharedCookies where
-      sharedCookie.name == cookie.name &&
-      sharedCookie.path == cookie.path &&
-      AppDelegate.matchDomain(cookieDomain: sharedCookie.domain, candidate: cookie.domain, host: host) {
-      storage.deleteCookie(sharedCookie)
-    }
-  }
-
-  /// 暴力穷举删除指定 name 的所有变体 (WK store + HTTPCookieStorage.shared 双删)
-  private static func nukeAllVariantsIOS(
-    url: URL,
-    name: String,
-    domainCandidates: [String?],
-    pathCandidates: [String],
-    result: @escaping FlutterResult
-  ) {
-    let store = WKWebsiteDataStore.default().httpCookieStore
-    let host = (url.host ?? "").lowercased()
-
-    store.getAllCookies { cookies in
-      // 枚举真实 cookie 对象，按 name + 适用域过滤（与 countCookiesByNameIOS 对齐），
-      // 逐个 store.delete 真实对象。不再用 domainCandidates/pathCandidates 猜测，
-      // 杜绝 "count 数得到、nuke 删不掉" 的残留循环。
-      let matching = cookies.filter { cookie in
-        guard cookie.name == name else { return false }
-        let cookieDomain = (cookie.domain.hasPrefix(".")
-          ? String(cookie.domain.dropFirst())
-          : cookie.domain).lowercased()
-        return host == cookieDomain || host.hasSuffix("." + cookieDomain)
-      }
-
-      CookieStoreObserverHandler.shared.beginInternalWrite()
-      let group = DispatchGroup()
-      let countLock = NSLock()
-      var deletedCount = 0
-
-      for cookie in matching {
-        group.enter()
-        store.delete(cookie) {
-          countLock.lock()
-          deletedCount += 1
-          countLock.unlock()
-          group.leave()
-        }
-      }
-
-      // 双删: 同步清 HTTPCookieStorage.shared 中匹配的同名 cookie
-      let storage = HTTPCookieStorage.shared
-      if let sharedCookies = storage.cookies {
-        for cookie in sharedCookies where cookie.name == name {
-          let cookieDomain = (cookie.domain.hasPrefix(".")
-            ? String(cookie.domain.dropFirst())
-            : cookie.domain).lowercased()
-          if host == cookieDomain || host.hasSuffix("." + cookieDomain) {
-            storage.deleteCookie(cookie)
-          }
-        }
-      }
-
-      group.notify(queue: .main) {
-        CookieStoreObserverHandler.shared.endInternalWrite()
-        result(deletedCount)
-      }
-    }
-  }
-
-  /// 精确删除指定 (name, domain, path) 的单条 cookie 变体
-  private static func deleteExactCookieIOS(
-    url: URL,
-    name: String,
-    domain: String?,
-    path: String,
-    result: @escaping FlutterResult
-  ) {
-    let store = WKWebsiteDataStore.default().httpCookieStore
-    let host = (url.host ?? "").lowercased()
-
-    store.getAllCookies { cookies in
-      let target = cookies.first { cookie in
-        cookie.name == name &&
-        cookie.path == path &&
-        AppDelegate.matchDomain(cookieDomain: cookie.domain, candidate: domain, host: host)
-      }
-      guard let cookie = target else {
-        DispatchQueue.main.async { result(false) }
-        return
-      }
-
-      CookieStoreObserverHandler.shared.beginInternalWrite()
-      let group = DispatchGroup()
-      group.enter()
-      store.delete(cookie) {
-        group.leave()
-      }
-
-      // 双删: 同步清 HTTPCookieStorage.shared 中匹配的同名 cookie
-      let storage = HTTPCookieStorage.shared
-      if let sharedCookies = storage.cookies {
-        for sharedCookie in sharedCookies where
-          sharedCookie.name == name &&
-          sharedCookie.path == path &&
-          AppDelegate.matchDomain(cookieDomain: sharedCookie.domain, candidate: domain, host: host) {
-          storage.deleteCookie(sharedCookie)
-        }
-      }
-
-      group.notify(queue: .main) {
-        CookieStoreObserverHandler.shared.endInternalWrite()
-        result(true)
-      }
-    }
-  }
-
-  /// 读取指定 url 下所有适用 cookie 的完整信息
-  ///
-  /// 适用判断: cookie.domain (去前导点) == host, 或 host 是其子域
-  private static func getAllCookieInfosIOS(url: URL, result: @escaping FlutterResult) {
-    let store = WKWebsiteDataStore.default().httpCookieStore
-    let host = (url.host ?? "").lowercased()
-
-    store.getAllCookies { cookies in
-      let applicable = cookies.filter { cookie in
-        let cookieDomain = (cookie.domain.hasPrefix(".")
-          ? String(cookie.domain.dropFirst())
-          : cookie.domain).lowercased()
-        return host == cookieDomain || host.hasSuffix("." + cookieDomain)
-      }
-
-      let infos: [[String: Any?]] = applicable.map { cookie in
-        return [
-          "name": cookie.name,
-          "value": cookie.value,
-          "domain": cookie.domain,
-          "path": cookie.path,
-          "isSecure": cookie.isSecure,
-          "isHttpOnly": cookie.isHTTPOnly,
-          "expiresMillis": cookie.expiresDate.map { Int($0.timeIntervalSince1970 * 1000) },
-          "sameSite": AppDelegate.sameSiteString(cookie),
-        ]
-      }
-
-      DispatchQueue.main.async {
-        result(infos)
-      }
-    }
-  }
-
-  /// 统计指定 url 下 cookie name 的变体数 (适用域过滤)
-  private static func countCookiesByNameIOS(url: URL, name: String, result: @escaping FlutterResult) {
-    let store = WKWebsiteDataStore.default().httpCookieStore
-    let host = (url.host ?? "").lowercased()
-
-    store.getAllCookies { cookies in
-      let count = cookies.filter { cookie in
-        guard cookie.name == name else { return false }
-        let cookieDomain = (cookie.domain.hasPrefix(".")
-          ? String(cookie.domain.dropFirst())
-          : cookie.domain).lowercased()
-        return host == cookieDomain || host.hasSuffix("." + cookieDomain)
-      }.count
-
-      DispatchQueue.main.async {
-        result(count)
-      }
-    }
-  }
+  // Cookie 引擎 v0.4.0 原语已提取到 apple/Shared/CookiePrimitives.swift
+  // (iOS/macOS 共享, 可被 RunnerTests 以 @testable import 单测)
 
   /// 启动临时 HTTP server 提供 mobileconfig 下载，使用 SFSafariViewController 在应用内打开
   /// 应用保持前台运行，避免后台被系统回收导致下载失败
@@ -752,7 +548,7 @@ import workmanager_apple
 // 防重入: 我们自己 setCookie/nukeAllVariants/deleteExactCookie 时,
 // internalWriteCount > 0, observer 看到事件就忽略,
 // 避免 setCookie → cookiesDidChange → sweep → setCookie 死循环。
-class CookieStoreObserverHandler: NSObject, WKHTTPCookieStoreObserver {
+class CookieStoreObserverHandler: NSObject, WKHTTPCookieStoreObserver, CookieWriteGuard {
   static let shared = CookieStoreObserverHandler()
 
   private var channel: FlutterMethodChannel?

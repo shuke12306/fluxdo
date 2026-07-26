@@ -56,6 +56,10 @@ jobs:
       - name: Pod install
         run: pod install --project-directory=ios
 
+      # ARCHS=arm64:模拟器默认按 ARCHS_STANDARD(arm64+x86_64)双架构编译,
+      # 但 native_animated_image_codec.xcframework 等 vendored 产物只带
+      # ios-arm64-simulator 切片,x86_64 缺失会让 CocoaPods 拒绝整个 framework
+      # (报 Framework not found);runner 与 Rust 静态库均为 arm64,强制单架构。
       - name: Run RunnerTests on iOS Simulator
         run: |
           set -o pipefail
@@ -66,6 +70,8 @@ jobs:
             -scheme Runner \
             -destination "platform=iOS Simulator,name=${DEVICE}" \
             -resultBundlePath build/ios-test-results.xcresult \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO
 
